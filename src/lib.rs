@@ -184,6 +184,44 @@ impl<'a> Iterator for PrefixIter<'a> {
     }
 }
 
+/// Iterator over the outgoing edges of a single trie node.
+///
+/// Yields `(byte, child_node)` pairs in cedar's native sibling order
+/// (insertion-order within the same parent).  Skips the terminator
+/// (byte 0) used internally to store the node's value, since callers
+/// driving custom walks should consume that via [`Cedar::value_at`].
+#[derive(Clone)]
+pub struct ChildIter<'a> {
+    cedar: &'a Cedar,
+    node: usize,
+    next_byte: u8,
+}
+
+impl<'a> Iterator for ChildIter<'a> {
+    type Item = (u8, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let b = self.next_byte;
+        if b == 0 {
+            return None;
+        }
+        let base = self.cedar.array[self.node].base();
+        if base < 0 {
+            return None;
+        }
+        let child = (base ^ (b as i32)) as usize;
+        // Defensive: a stale sibling link should never escape, but if
+        // the slot is no longer owned by `node` we stop cleanly.
+        match self.cedar.array.get(child) {
+            Some(n) if n.check == self.node as i32 => {
+                self.next_byte = self.cedar.n_infos[child].sibling;
+                Some((b, child))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Iterator for `common_prefix_predict`
 #[derive(Clone)]
 pub struct PrefixPredictIter<'a> {
@@ -520,6 +558,129 @@ impl Cedar {
     /// To return the list of words in the dictionary that has `key` as their prefix.
     pub fn common_prefix_predict(&self, key: &str) -> Option<Vec<(i32, usize)>> {
         self.common_prefix_predict_iter(key).map(Some).collect()
+    }
+
+    // -----------------------------------------------------------------
+    // Low-level traversal primitives
+    //
+    // These expose the double-array trie structure to callers that
+    // implement custom walks (e.g. Levenshtein automaton intersection,
+    // wildcard / regex DFA walks, n-gram pre-filters).  They are kept
+    // small and orthogonal so that any caller can drive the trie one
+    // edge at a time without paying for full prefix scans.
+    // -----------------------------------------------------------------
+
+    /// Index of the trie root.  All custom walks start here.
+    #[inline]
+    pub fn root(&self) -> usize {
+        0
+    }
+
+    /// Look up the value stored at `node`, if any.
+    ///
+    /// In the standard (non-reduced) double-array, a node has a value
+    /// when its `base ^ 0` child slot is owned by it; that slot's
+    /// `base_` field holds the value.  Returns `None` for branch-only
+    /// nodes and for nodes whose terminator slot has not been assigned.
+    pub fn value_at(&self, node: usize) -> Option<i32> {
+        #[cfg(feature = "reduced-trie")]
+        {
+            // In reduced-trie mode a non-negative `base_` directly
+            // encodes the value.
+            if self.array[node].base_ >= 0 {
+                return Some(self.array[node].base_);
+            }
+        }
+        let base = self.array[node].base();
+        if base < 0 {
+            return None;
+        }
+        let value_slot = base as usize;
+        let n = self.array.get(value_slot)?;
+        if n.check == node as i32 {
+            Some(n.base_)
+        } else {
+            None
+        }
+    }
+
+    /// Iterate `(byte, child_node)` pairs for the real edges out of
+    /// `node`, skipping the terminator (byte 0) used to store values.
+    ///
+    /// Walks the cedar sibling chain in O(fan-out).  Defensive on
+    /// `check` ownership so it stays sound even if called on a free
+    /// or partially-built slot.
+    #[inline]
+    pub fn children_iter(&self, node: usize) -> ChildIter<'_> {
+        // The first physical child byte; 0 means the only "child" is
+        // the terminator value slot (advance to its sibling).
+        let first = self.n_infos[node].child;
+        let start_byte = if first == 0 {
+            let base = self.array[node].base();
+            if base < 0 {
+                0
+            } else {
+                self.n_infos[base as usize].sibling
+            }
+        } else {
+            first
+        };
+        ChildIter {
+            cedar: self,
+            node,
+            next_byte: start_byte,
+        }
+    }
+
+    /// Follow the edge labelled `byte` out of `node`, returning the
+    /// child node index if such an edge exists.
+    ///
+    /// This is the constant-time random-access primitive that custom
+    /// walks (Levenshtein automaton intersection, regex/wildcard DFA
+    /// product walks, prefix predicates) rely on.  Together with
+    /// [`Cedar::root`], [`Cedar::value_at`] and [`Cedar::children_iter`]
+    /// it forms a complete, allocation-free read-only API over the
+    /// double-array trie.
+    ///
+    /// Rejects `byte == 0` since byte 0 is reserved internally as the
+    /// terminator slot for values — callers must read those via
+    /// [`Cedar::value_at`] rather than as an edge transition.
+    #[inline]
+    pub fn transition(&self, node: usize, byte: u8) -> Option<usize> {
+        if byte == 0 {
+            return None;
+        }
+        let base = self.array.get(node)?.base();
+        if base < 0 {
+            return None;
+        }
+        let child = (base ^ (byte as i32)) as usize;
+        let n = self.array.get(child)?;
+        if n.check == node as i32 {
+            Some(child)
+        } else {
+            None
+        }
+    }
+
+    /// Number of real outgoing edges from `node` (terminator excluded).
+    ///
+    /// Convenience over `children_iter(node).count()` with identical
+    /// O(fan-out) cost — provided so callers can quickly distinguish
+    /// branch nodes from value-only leaves without constructing an
+    /// iterator.
+    #[inline]
+    pub fn num_children(&self, node: usize) -> usize {
+        self.children_iter(node).count()
+    }
+
+    /// `true` if `node` has no real outgoing edges (terminator excluded).
+    ///
+    /// A leaf may still carry a value — combine with [`Cedar::value_at`]
+    /// to distinguish value-leaves from genuinely empty slots.
+    #[inline]
+    pub fn is_leaf(&self, node: usize) -> bool {
+        self.children_iter(node).next().is_none()
     }
 
     // To get the cursor of the first leaf node starting by `from`
@@ -1413,5 +1574,304 @@ mod tests {
         assert_eq!(cedar.exact_match_search("亞丁港").map(|t| t.0), Some(8));
         assert_eq!(cedar.exact_match_search("亝").map(|t| t.0), Some(4));
         assert_eq!(cedar.exact_match_search("些須").map(|t| t.0), Some(1));
+    }
+
+    // -----------------------------------------------------------------
+    // Low-level traversal API: root / transition / value_at /
+    // children_iter / num_children / is_leaf
+    // -----------------------------------------------------------------
+
+    /// Walk a byte slice from `root` via `transition` and return the
+    /// node index where the walk ends, or `None` if any byte has no
+    /// matching outgoing edge.  Helper used throughout the tests below.
+    fn walk(cedar: &Cedar, key: &[u8]) -> Option<usize> {
+        let mut node = cedar.root();
+        for &b in key {
+            node = cedar.transition(node, b)?;
+        }
+        Some(node)
+    }
+
+    #[test]
+    fn traversal_root_is_zero() {
+        let cedar = Cedar::new();
+        assert_eq!(cedar.root(), 0);
+    }
+
+    #[test]
+    fn traversal_transition_roundtrips_exact_match() {
+        let dict: Vec<(&str, i32)> = vec![
+            ("a", 0),
+            ("ab", 1),
+            ("abc", 2),
+            ("abd", 3),
+            ("b", 4),
+            ("bee", 5),
+            ("zebra", 6),
+        ];
+        let mut cedar = Cedar::new();
+        cedar.build(&dict);
+
+        for (key, value) in &dict {
+            let node = walk(&cedar, key.as_bytes())
+                .unwrap_or_else(|| panic!("transition walk for {key:?} returned None"));
+            assert_eq!(
+                cedar.value_at(node),
+                Some(*value),
+                "value_at after transition walk for {key:?}"
+            );
+            // Cross-check against the existing exact_match_search.
+            assert_eq!(
+                cedar.exact_match_search(key).map(|t| t.0),
+                Some(*value),
+                "exact_match_search disagrees with transition walk for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traversal_transition_rejects_terminator_byte() {
+        let mut cedar = Cedar::new();
+        cedar.build(&[("a", 1i32)]);
+        // Byte 0 must never be returned as an edge transition — it is
+        // reserved for the value slot under each node.
+        assert_eq!(cedar.transition(cedar.root(), 0), None);
+    }
+
+    #[test]
+    fn traversal_transition_returns_none_for_missing_edge() {
+        let mut cedar = Cedar::new();
+        cedar.build(&[("abc", 1i32)]);
+        let a = cedar.transition(cedar.root(), b'a').expect("'a' present");
+        // No edge labelled 'z' under 'a'.
+        assert_eq!(cedar.transition(a, b'z'), None);
+        // No edge labelled 'q' from root.
+        assert_eq!(cedar.transition(cedar.root(), b'q'), None);
+    }
+
+    #[test]
+    fn traversal_value_at_is_none_on_interior_branch() {
+        let mut cedar = Cedar::new();
+        // "ab" is *not* inserted — only "abc" is.  Walking to "ab"
+        // must land on an interior branch node with no value.
+        cedar.build(&[("abc", 42i32)]);
+        let ab = walk(&cedar, b"ab").expect("ab interior must exist");
+        assert_eq!(cedar.value_at(ab), None);
+        let abc = walk(&cedar, b"abc").expect("abc leaf must exist");
+        assert_eq!(cedar.value_at(abc), Some(42));
+    }
+
+    #[test]
+    fn traversal_value_at_on_branch_with_value() {
+        // "ab" is *both* a value and a branch (prefix of "abc").  In
+        // cedar this means the node has a terminator child *and* a
+        // letter child.  value_at must return the terminator's value.
+        let mut cedar = Cedar::new();
+        cedar.build(&[("ab", 1i32), ("abc", 2)]);
+        let ab = walk(&cedar, b"ab").expect("ab must exist");
+        let abc = walk(&cedar, b"abc").expect("abc must exist");
+        assert_eq!(cedar.value_at(ab), Some(1));
+        assert_eq!(cedar.value_at(abc), Some(2));
+    }
+
+    #[test]
+    fn traversal_children_iter_at_root_matches_distinct_first_bytes() {
+        let dict: &[(&str, i32)] = &[
+            ("apple", 0),
+            ("ape", 1),
+            ("banana", 2),
+            ("car", 3),
+            ("cat", 4),
+            ("zebra", 5),
+        ];
+        let mut cedar = Cedar::new();
+        cedar.build(dict);
+
+        let mut got: Vec<u8> = cedar.children_iter(cedar.root()).map(|(b, _)| b).collect();
+        got.sort_unstable();
+        let mut want: Vec<u8> = dict.iter().map(|(k, _)| k.as_bytes()[0]).collect();
+        want.sort_unstable();
+        want.dedup();
+        assert_eq!(got, want, "root children must equal distinct first bytes");
+    }
+
+    #[test]
+    fn traversal_children_iter_skips_terminator() {
+        // Node "ab" has BOTH a value (terminator at byte 0) AND a real
+        // child 'c'.  children_iter must NOT yield byte 0, only 'c'.
+        let mut cedar = Cedar::new();
+        cedar.build(&[("ab", 1i32), ("abc", 2)]);
+        let ab = walk(&cedar, b"ab").expect("ab");
+        let children: Vec<u8> = cedar.children_iter(ab).map(|(b, _)| b).collect();
+        assert_eq!(children, vec![b'c']);
+        // And the (byte, child) pair indeed walks to "abc".
+        let (_, c_node) = cedar.children_iter(ab).next().unwrap();
+        assert_eq!(cedar.value_at(c_node), Some(2));
+    }
+
+    #[test]
+    fn traversal_children_iter_full_dfs_matches_inserted_keys() {
+        // Reconstruct every (key, value) pair by exhaustive DFS via
+        // root / children_iter / value_at, then compare against the
+        // input set.  This is the strongest invariant: if DFS round-
+        // trips, the low-level API is internally consistent.
+        let dict: &[(&str, i32)] = &[
+            ("a", 0),
+            ("ab", 1),
+            ("abc", 2),
+            ("abcd", 3),
+            ("abd", 4),
+            ("b", 5),
+            ("bee", 6),
+            ("zebra", 7),
+            ("中", 8),
+            ("中华", 9),
+            ("中华人民", 10),
+            ("网", 11),
+            ("网球", 12),
+        ];
+        let mut cedar = Cedar::new();
+        cedar.build(dict);
+
+        let mut found: Vec<(Vec<u8>, i32)> = Vec::new();
+        let mut stack: Vec<(usize, Vec<u8>)> = vec![(cedar.root(), Vec::new())];
+        while let Some((node, prefix)) = stack.pop() {
+            if let Some(v) = cedar.value_at(node) {
+                // Root itself has no inserted empty key in this dict,
+                // but record any value we see — the comparison below
+                // will catch spurious entries.
+                if !prefix.is_empty() {
+                    found.push((prefix.clone(), v));
+                }
+            }
+            for (b, child) in cedar.children_iter(node) {
+                let mut next = prefix.clone();
+                next.push(b);
+                stack.push((child, next));
+            }
+        }
+        found.sort();
+
+        let mut want: Vec<(Vec<u8>, i32)> = dict
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), *v))
+            .collect();
+        want.sort();
+
+        assert_eq!(found, want, "DFS via low-level API must round-trip all keys");
+    }
+
+    #[test]
+    fn traversal_num_children_and_is_leaf() {
+        let mut cedar = Cedar::new();
+        cedar.build(&[("ab", 1i32), ("abc", 2), ("abd", 3), ("z", 4)]);
+        let root = cedar.root();
+        // Root has children {'a', 'z'}.
+        assert_eq!(cedar.num_children(root), 2);
+        assert!(!cedar.is_leaf(root));
+
+        let a = cedar.transition(root, b'a').expect("a");
+        let ab = cedar.transition(a, b'b').expect("ab");
+        // 'ab' branches to 'c' and 'd' (terminator excluded).
+        assert_eq!(cedar.num_children(ab), 2);
+        assert!(!cedar.is_leaf(ab));
+
+        let abc = cedar.transition(ab, b'c').expect("abc");
+        assert_eq!(cedar.num_children(abc), 0);
+        assert!(cedar.is_leaf(abc));
+        // Leaf still carries a value.
+        assert_eq!(cedar.value_at(abc), Some(2));
+
+        let z = cedar.transition(root, b'z').expect("z");
+        assert_eq!(cedar.num_children(z), 0);
+        assert!(cedar.is_leaf(z));
+        assert_eq!(cedar.value_at(z), Some(4));
+    }
+
+    #[test]
+    fn traversal_handles_full_byte_range() {
+        // Cover every non-zero byte 1..=255 as a single-byte key
+        // under root, then verify transition + value_at round-trip
+        // and children_iter enumerates the full set.
+        let mut keys: Vec<(Vec<u8>, i32)> = (1u16..=255)
+            .map(|b| (vec![b as u8], b as i32))
+            .collect();
+        let key_refs: Vec<(&str, i32)> = keys
+            .iter_mut()
+            .filter_map(|(k, v)| {
+                // Cedar's build wants &str; skip bytes that don't form
+                // valid UTF-8 on their own (>= 0x80).  We still get
+                // 1..0x80 (127 keys) which is plenty to stress the
+                // sibling chain at root.
+                core::str::from_utf8(k).ok().map(|s| (s, *v))
+            })
+            .collect();
+        let mut cedar = Cedar::new();
+        cedar.build(&key_refs);
+
+        for (s, v) in &key_refs {
+            let n = cedar.transition(cedar.root(), s.as_bytes()[0]).unwrap();
+            assert_eq!(cedar.value_at(n), Some(*v));
+        }
+
+        let mut got: Vec<u8> = cedar.children_iter(cedar.root()).map(|(b, _)| b).collect();
+        got.sort_unstable();
+        let mut want: Vec<u8> = key_refs.iter().map(|(s, _)| s.as_bytes()[0]).collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn traversal_on_empty_cedar_is_safe() {
+        let cedar = Cedar::new();
+        let root = cedar.root();
+        assert_eq!(cedar.root(), 0);
+        assert_eq!(cedar.value_at(root), None);
+        assert_eq!(cedar.transition(root, b'a'), None);
+        assert_eq!(cedar.num_children(root), 0);
+        assert!(cedar.is_leaf(root));
+        assert!(cedar.children_iter(root).next().is_none());
+    }
+
+    #[test]
+    fn traversal_consistent_with_common_prefix_search() {
+        // Build, then for every inserted key drive a transition walk
+        // and collect ancestor values — the resulting set must equal
+        // common_prefix_search(key).
+        let dict: &[(&str, i32)] = &[
+            ("a", 0),
+            ("ab", 1),
+            ("abc", 2),
+            ("abcd", 3),
+            ("abcde", 4),
+        ];
+        let mut cedar = Cedar::new();
+        cedar.build(dict);
+
+        for (key, _) in dict {
+            let mut node = cedar.root();
+            let mut walk_values: Vec<i32> = Vec::new();
+            for &b in key.as_bytes() {
+                node = match cedar.transition(node, b) {
+                    Some(n) => n,
+                    None => break,
+                };
+                if let Some(v) = cedar.value_at(node) {
+                    walk_values.push(v);
+                }
+            }
+            let mut prefix_values: Vec<i32> = cedar
+                .common_prefix_search(key)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect();
+            walk_values.sort_unstable();
+            prefix_values.sort_unstable();
+            assert_eq!(
+                walk_values, prefix_values,
+                "transition+value_at walk must agree with common_prefix_search for {key:?}"
+            );
+        }
     }
 }
