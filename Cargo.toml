@@ -1,7 +1,7 @@
 [package]
 name = "cedarwood"
 description = "efficiently-updatable double-array trie in Rust (ported from cedar)"
-repository = "https://github.com/infinilabs/cedarwood"
+repository = "https://github.com/pizza-rs/cedarwood"
 version = "0.4.6"
 license = "BSD-2-Clause"
 authors = ["Paul Meng <me@paulme.ng>"]

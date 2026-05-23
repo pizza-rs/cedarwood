@@ -8,7 +8,7 @@ Add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cedarwood = { git = "https://github.com/infinilabs/cedarwood", branch = "main",default-features = false }
+cedarwood = { git = "https://github.com/pizza-rs/cedarwood", branch = "main",default-features = false }
 ```
 
 then you are good to go. If you are using Rust 2015 you have to `extern crate cedarwood` to your crate root as well.
